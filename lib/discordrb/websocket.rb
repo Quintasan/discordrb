@@ -8,6 +8,15 @@ module Discordrb
   class WebSocket
     attr_reader :open_handler, :message_handler, :close_handler, :error_handler
 
+    # @return [Symbol, nil] the type of the last message received, `:text` or `:binary`
+    attr_reader :last_message_type
+
+    # Records the type of the message that the message handler is currently being called with.
+    # @!visibility private
+    def record_message_type(type)
+      @last_message_type = type
+    end
+
     # Create a new WebSocket and connect to the given endpoint.
     # @param endpoint [String] Where to connect to.
     # @param open_handler [#call] The handler that should be called when the websocket has opened successfully.
@@ -35,6 +44,7 @@ module Discordrb
           if msg.code
             instance.close_handler.call(msg)
           else
+            instance.record_message_type(msg.type)
             instance.message_handler.call(msg.data)
           end
         end
@@ -45,8 +55,9 @@ module Discordrb
 
     # Send data over this WebSocket
     # @param data [String] What to send
-    def send(data)
-      @client.send(data)
+    # @param type [Symbol] The type of the message, `:text` or `:binary`
+    def send(data, type: :text)
+      @client.send(data, type: type)
     end
 
     # Close the WebSocket connection

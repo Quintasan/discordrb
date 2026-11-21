@@ -54,6 +54,18 @@ This section only applies to you if you want to use voice functionality.
 - [libsodium](https://github.com/shardlab/discordrb/wiki/Installing-libsodium)
 - A compiled libopus distribution for your system, anywhere the script can find it. See [here](https://github.com/shardlab/discordrb/wiki/Installing-libopus) for installation instructions.
 - [FFmpeg](https://www.ffmpeg.org/download.html) installed and in your PATH
+- [libdave](https://github.com/discord/libdave/releases), optional, for Discord's end-to-end encrypted voice calls (see
+  below)
+
+#### Voice end-to-end encryption (DAVE)
+
+Discord encrypts voice calls end to end with DAVE and drops connections that do not support it. discordrb speaks DAVE
+through libdave, Discord's C library. Install the libdave shared library for your platform, then either put it where
+Ruby can find it or point `DAVE_LIBRARY_PATH` to the file. discordrb loads `libdave.so`, `libdave.so.1`,
+`libdave.dylib` or `dave.dll` from the usual places by default.
+
+Without libdave, voice connections still work in pass-through mode, but Discord may disconnect them from encrypted
+channels. The library is optional: when it is missing, discordrb logs a warning.
 
 ## Installation
 
