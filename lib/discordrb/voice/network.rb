@@ -6,6 +6,8 @@ require 'json'
 
 require 'discordrb/websocket'
 require 'discordrb/voice/opcodes'
+require 'discordrb/voice/dave'
+require 'discordrb/voice/dave/handler'
 
 begin
   LIBSODIUM_AVAILABLE = if ENV['DISCORDRB_NONACL']
@@ -41,6 +43,9 @@ module Discordrb::Voice
 
     # Sets the secret key used for encryption
     attr_writer :secret_key
+
+    # @return [Discordrb::Voice::DAVE::Handler, nil] the DAVE handler that encrypts the audio frames end-to-end
+    attr_accessor :dave_handler
 
     # The UDP encryption mode
     attr_reader :mode
@@ -82,6 +87,11 @@ module Discordrb::Voice
     # @param time [Integer] When this packet should be played back, in no particular unit (essentially just the
     #   sequence number multiplied by 960)
     def send_audio(buf, sequence, time)
+      # Encrypt the frame end-to-end first, if this connection takes part in an encrypted call. The field is dropped
+      # when the frame cannot be encrypted, because it must not be sent in plaintext.
+      buf = @dave_handler.encrypt_audio(buf) if @dave_handler
+      return if buf.nil?
+
       # Header of the audio packet
       header = generate_header(sequence, time)
 
@@ -184,6 +194,17 @@ module Discordrb::Voice
       @endpoint = endpoint
 
       @udp = VoiceUDP.new
+
+      # Only take part in DAVE when libdave is available, otherwise the connection is a plain (unencrypted) one.
+      return unless DAVE.available?
+
+      @dave_handler = DAVE::Handler.new(
+        channel_id: channel.id,
+        self_user_id: bot.profile.id,
+        send_json: ->(opcode, data) { send_opcode(opcode, data) },
+        send_binary: ->(opcode, payload) { send_binary_opcode(opcode, payload) }
+      )
+      @udp.dave_handler = @dave_handler
     end
 
     # Send a connection init packet (op 0)
@@ -192,15 +213,18 @@ module Discordrb::Voice
     # @param session_id [String] The voice session ID
     # @param token [String] The Discord authentication token
     def send_init(server_id, bot_user_id, session_id, token)
-      send_opcode(
-        Opcodes::IDENTIFY,
-        {
-          server_id: server_id,
-          user_id: bot_user_id,
-          session_id: session_id,
-          token: token
-        }
-      )
+      data = {
+        server_id: server_id,
+        user_id: bot_user_id,
+        session_id: session_id,
+        token: token
+      }
+
+      # Declare DAVE support, so the gateway includes this connection in the end-to-end encryption handshake.
+      dave_version = DAVE.supported_protocol_version
+      data[:max_dave_protocol_version] = dave_version if dave_version.positive?
+
+      send_opcode(Opcodes::IDENTIFY, data)
     end
 
     # Sends the UDP connection packet (op 1)
@@ -256,6 +280,16 @@ module Discordrb::Voice
       }.to_json)
     end
 
+    # Sends a binary message to the voice gateway, as the DAVE handshake requires. Unlike the messages the gateway
+    # sends, these are not prefixed with a sequence number.
+    # @param opcode [Integer] The binary opcode to send
+    # @param payload [String] The payload of the message
+    def send_binary_opcode(opcode, payload)
+      message = DAVE::Framing.client_message(opcode, payload)
+      @bot.debug("Sending binary voice opcode #{opcode} (#{message.bytesize} bytes)")
+      @client.send(message, type: :binary)
+    end
+
     # Event handlers; public for websocket-simple to work correctly
     # @!visibility private
     def websocket_open
@@ -268,10 +302,31 @@ module Discordrb::Voice
 
     # @!visibility private
     def websocket_message(msg)
+      # The DAVE handshake messages are binary, everything else is JSON
+      if @client&.last_message_type == :binary
+        websocket_binary_message(msg)
+      else
+        websocket_json_message(msg)
+      end
+    end
+
+    # @!visibility private
+    def websocket_binary_message(msg)
+      sequence, opcode, payload = DAVE::Framing.parse_server_message(msg)
+      @bot.debug("Received binary VWS message with opcode #{opcode} and sequence #{sequence}")
+
+      @dave_handler&.handle_binary(opcode, payload)
+    end
+
+    # @!visibility private
+    def websocket_json_message(msg)
       @bot.debug("Received VWS message! #{msg}")
       packet = JSON.parse(msg)
 
       @seq = packet['seq'] if packet['seq']
+
+      # The DAVE messages are handled first, as they also change what the UDP connection has to do
+      @dave_handler&.handle_json(packet['op'], packet['d'])
 
       case packet['op']
       when Discordrb::Voice::Opcodes::READY
@@ -285,6 +340,11 @@ module Discordrb::Voice
 
         @udp.connect(@ws_data['ip'], @port, @ssrc)
         @udp.send_discovery
+
+        if @dave_handler
+          @dave_handler.ssrc = @ssrc
+          @bot.debug("Using DAVE protocol version #{@dave_handler.protocol_version}")
+        end
       when Discordrb::Voice::Opcodes::SESSION_DESCRIPTION
         # Opcode 4 sends the secret key used for encryption
         @ws_data = packet['d']
@@ -341,6 +401,7 @@ module Discordrb::Voice
     # Disconnects the websocket and kills the thread
     def destroy
       @heartbeat_running = false
+      @dave_handler&.close
     end
 
     private
