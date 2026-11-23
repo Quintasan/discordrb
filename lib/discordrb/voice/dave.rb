@@ -68,6 +68,13 @@ module Discordrb::Voice
         @available = load_library
       end
 
+      # Forgets whether libdave could be loaded, so that the next {available?} call looks for it again. This is
+      # useful for tests, and for scripts that install libdave while the bot is running.
+      # @return [void]
+      def reset_availability!
+        @available = nil
+      end
+
       # The DAVE protocol version that voice connections should declare. Zero means that the connection does not
       # support DAVE, which is the case when libdave is unavailable.
       # @return [Integer]
@@ -91,6 +98,7 @@ module Discordrb::Voice
       def load_library
         require_relative 'dave/library'
         install_log_sink
+        logger.debug("Loaded libdave from #{Library.loaded_path || 'the dynamic linker search path'}")
         true
       rescue LoadError, FFI::NotFoundError => e
         logger.warn('libdave could not be loaded, so voice connections will not use DAVE end-to-end ' \

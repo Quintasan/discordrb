@@ -23,6 +23,20 @@ describe Discordrb::Voice::DAVE do
     end
   end
 
+  describe '.available?' do
+    after { described_class.reset_availability! }
+
+    it 'looks for libdave again after the result was forgotten' do
+      allow(described_class).to receive(:load_library).and_return(false, true)
+      described_class.reset_availability!
+      expect(described_class.available?).to be false
+
+      described_class.reset_availability!
+
+      expect(described_class.available?).to be true
+    end
+  end
+
   describe Discordrb::Voice::DAVE::Framing do
     describe '.parse_server_message' do
       it 'splits the sequence number, the opcode and the payload' do
@@ -213,14 +227,19 @@ describe Discordrb::Voice::DAVE::Handler do
       expect(sent).to eq [[opcodes::DAVE_TRANSITION_READY, { transition_id: 9 }]]
     end
 
-    it 'flags a commit it cannot process as invalid' do
+    it 'rejects a commit it cannot process and starts over with a new group' do
+      handler.handle_binary(opcodes::DAVE_MLS_EXTERNAL_SENDER, 'external-sender')
       start_group
       allow(commit_result).to receive(:failed?).and_return(true)
       allow(session).to receive(:process_commit).and_return(commit_result)
 
       handler.handle_binary(opcodes::DAVE_MLS_ANNOUNCE_COMMIT_TRANSITION, "#{[9].pack('n')}commit")
 
-      expect(sent).to eq [[opcodes::DAVE_MLS_INVALID_COMMIT_WELCOME, { transition_id: 9 }]]
+      expect(sent).to eq [
+        [opcodes::DAVE_MLS_INVALID_COMMIT_WELCOME, { transition_id: 9 }],
+        [opcodes::DAVE_MLS_KEY_PACKAGE, 'key-package']
+      ]
+      expect(session).to have_received(:init).with(1, channel_id).twice
     end
 
     it 'stays quiet about its own commit' do
@@ -231,6 +250,16 @@ describe Discordrb::Voice::DAVE::Handler do
       handler.handle_binary(opcodes::DAVE_MLS_ANNOUNCE_COMMIT_TRANSITION, "#{[9].pack('n')}commit")
 
       expect(sent).to be_empty
+    end
+
+    it 'ignores a commit message that is too short to carry a transition ID' do
+      start_group
+      allow(session).to receive(:process_commit)
+
+      handler.handle_binary(opcodes::DAVE_MLS_ANNOUNCE_COMMIT_TRANSITION, "\x09".b)
+
+      expect(sent).to be_empty
+      expect(session).not_to have_received(:process_commit)
     end
 
     it 'executes the initial transition right away instead of answering it' do
@@ -274,13 +303,14 @@ describe Discordrb::Voice::DAVE::Handler do
       expect(sent).to be_empty
     end
 
-    it 'flags a welcome it cannot process as invalid' do
+    it 'rejects a welcome it cannot process and resets the group' do
       start_group
       allow(session).to receive(:process_welcome).and_return(false)
 
       handler.handle_binary(opcodes::DAVE_MLS_WELCOME, "#{[4].pack('n')}welcome")
 
       expect(sent).to eq [[opcodes::DAVE_MLS_INVALID_COMMIT_WELCOME, { transition_id: 4 }]]
+      expect(session).to have_received(:init).with(1, channel_id).twice
     end
   end
 
@@ -317,6 +347,26 @@ describe Discordrb::Voice::DAVE::Handler do
       expect(encryptor).to have_received(:key_ratchet=).with(ratchet)
       expect(encryptor).to have_received(:passthrough=).with(false)
     end
+
+    it 'ignores an execute for a transition that was never prepared' do
+      ratchet = instance_double(Discordrb::Voice::DAVE::KeyRatchet)
+      allow(ratchet).to receive(:destroy)
+      allow(session).to receive(:key_ratchet).with(self_user_id.to_s).and_return(ratchet)
+
+      encryptor = instance_double(Discordrb::Voice::DAVE::Encryptor, passthrough?: true)
+      allow(encryptor).to receive(:destroy)
+      allow(encryptor).to receive(:passthrough=)
+      allow(encryptor).to receive(:key_ratchet=)
+      allow(Discordrb::Voice::DAVE::Encryptor).to receive(:new).and_return(encryptor)
+      handler.ssrc = 9001
+
+      start_group
+      handler.handle_json(opcodes::SESSION_DESCRIPTION, { 'dave_protocol_version' => 1 })
+      handler.handle_json(opcodes::DAVE_EXECUTE_TRANSITION, { 'transition_id' => 7 })
+
+      expect(encryptor).not_to have_received(:key_ratchet=)
+      expect(encryptor).not_to have_received(:passthrough=)
+    end
   end
 
   describe '#encrypt_audio' do
@@ -347,18 +397,33 @@ describe Discordrb::Voice::DAVE::Handler do
 
       expect(handler.encrypt_audio('frame')).to be_nil
     end
-  end
 
-  describe 'a rejected commit' do
-    it 'resets the group and sends a new key package' do
-      handler.handle_binary(opcodes::DAVE_MLS_EXTERNAL_SENDER, 'external-sender')
+    it 'still passes frames through after a reset as long as nothing was encrypted yet' do
+      allow(encryptor).to receive(:passthrough?).and_return(true)
+
+      start_group
       handler.handle_json(opcodes::DAVE_PREPARE_EPOCH, { 'protocol_version' => 1, 'epoch' => 1 })
-      sent.clear
 
-      handler.handle_json(opcodes::DAVE_MLS_INVALID_COMMIT_WELCOME, { 'transition_id' => 3 })
+      expect(handler.encrypt_audio('frame')).to eq 'frame'
+    end
 
-      expect(session).to have_received(:init).with(1, channel_id).twice
-      expect(sent).to eq [[opcodes::DAVE_MLS_KEY_PACKAGE, 'key-package']]
+    it 'drops frames after a reset instead of sending them unencrypted' do
+      ratchet = instance_double(Discordrb::Voice::DAVE::KeyRatchet)
+      allow(ratchet).to receive(:destroy)
+      allow(session).to receive(:key_ratchet).with(self_user_id.to_s).and_return(ratchet)
+      allow(encryptor).to receive(:passthrough?).and_return(false)
+      allow(encryptor).to receive(:passthrough=)
+      allow(encryptor).to receive(:key_ratchet=)
+      allow(encryptor).to receive(:encrypt).and_return('encrypted')
+
+      start_group
+      handler.handle_json(opcodes::SESSION_DESCRIPTION, { 'dave_protocol_version' => 1 })
+      handler.handle_json(opcodes::DAVE_PREPARE_TRANSITION, { 'protocol_version' => 1, 'transition_id' => 0 })
+      expect(handler.encrypt_audio('frame')).to eq 'encrypted'
+
+      handler.handle_json(opcodes::DAVE_PREPARE_EPOCH, { 'protocol_version' => 1, 'epoch' => 1 })
+
+      expect(handler.encrypt_audio('frame')).to be_nil
     end
   end
 

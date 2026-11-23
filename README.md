@@ -59,13 +59,13 @@ This section only applies to you if you want to use voice functionality.
 
 #### Voice end-to-end encryption (DAVE)
 
-Discord encrypts voice calls end to end with DAVE and drops connections that do not support it. discordrb speaks DAVE
-through libdave, Discord's C library. Install the libdave shared library for your platform, then either put it where
-Ruby can find it or point `DAVE_LIBRARY_PATH` to the file. discordrb loads `libdave.so`, `libdave.so.1`,
-`libdave.dylib` or `dave.dll` from the usual places by default.
+Discord encrypts voice calls end to end with DAVE. discordrb speaks DAVE through libdave, Discord's C library.
+Install the libdave shared library for your platform, then either put it where the dynamic linker finds it or point
+`DAVE_LIBRARY_PATH` to the file. discordrb looks for `libdave.so`, `libdave.so.1`, `libdave.dylib` or `dave.dll` by
+default.
 
-Without libdave, voice connections still work in pass-through mode, but Discord may disconnect them from encrypted
-channels. The library is optional: when it is missing, discordrb logs a warning.
+Without libdave, voice connections still work unencrypted, but Discord downgrades encrypted channels so that they
+cannot take part in the end-to-end encryption. The library is optional: when it is missing, discordrb logs a warning.
 
 ## Installation
 

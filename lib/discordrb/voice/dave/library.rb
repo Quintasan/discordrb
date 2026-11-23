@@ -56,7 +56,6 @@ module Discordrb::Voice
       attach_function :daveSessionDestroy, [:pointer], :void
       attach_function :daveSessionInit, %i[pointer uint16 uint64 string], :void
       attach_function :daveSessionSetProtocolVersion, %i[pointer uint16], :void
-      attach_function :daveSessionReset, [:pointer], :void
       attach_function :daveSessionGetProtocolVersion, [:pointer], :uint16
       attach_function :daveSessionSetExternalSender, %i[pointer pointer size_t], :void
       attach_function :daveSessionAddRecognizedUser, %i[pointer string], :void
@@ -78,7 +77,6 @@ module Discordrb::Voice
       attach_function :daveEncryptorSetKeyRatchet, %i[pointer pointer], :void
       attach_function :daveEncryptorSetPassthroughMode, %i[pointer bool], :void
       attach_function :daveEncryptorIsPassthroughMode, [:pointer], :bool
-      attach_function :daveEncryptorHasKeyRatchet, [:pointer], :bool
       attach_function :daveEncryptorAssignSsrcToCodec, %i[pointer uint32 int], :void
       attach_function :daveEncryptorGetMaxCiphertextByteSize, %i[pointer int size_t], :size_t
       attach_function :daveEncryptorEncrypt, %i[pointer int uint32 pointer size_t pointer size_t pointer], :int

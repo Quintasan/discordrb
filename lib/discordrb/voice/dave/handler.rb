@@ -18,7 +18,7 @@ module Discordrb::Voice
       attr_reader :protocol_version
 
       # @return [Integer, nil] the SSRC of this connection, used to encrypt audio frames
-      attr_accessor :ssrc
+      attr_reader :ssrc
 
       # @param channel_id [Integer] The ID of the voice channel, used as the MLS group ID
       # @param self_user_id [Integer, String] The ID of the user this connection belongs to
@@ -36,17 +36,76 @@ module Discordrb::Voice
         @recognized_users = {}
         @external_sender = nil
         @pending_transition_id = nil
+        @pending_protocol_version = nil
         @session = nil
         @needs_key_package = false
         @encryptor = nil
         @key_ratchet = nil
         @closed = false
+        @encryption_established = false
+        @dropping_frames = false
+
+        # The gateway messages arrive on the voice websocket thread, the audio frames on the thread that plays them.
+        @lock = Mutex.new
+      end
+
+      # @param value [Integer, nil] the SSRC of this connection, used to encrypt audio frames
+      def ssrc=(value)
+        @lock.synchronize do
+          @ssrc = value
+          @encryptor&.ssrc = value
+        end
       end
 
       # Handles a JSON message from the voice gateway.
       # @param opcode [Integer]
       # @param data [Hash, nil]
       def handle_json(opcode, data)
+        @lock.synchronize { process_json(opcode, data) }
+      end
+
+      # Handles a binary message from the voice gateway. The sequence number must already be stripped off.
+      # @param opcode [Integer]
+      # @param payload [String] the rest of the message
+      def handle_binary(opcode, payload)
+        @lock.synchronize { process_binary(opcode, payload) }
+      end
+
+      # Encrypts one audio frame, if this connection takes part in an established group.
+      # @param frame [String] one Opus frame
+      # @return [String, nil] the frame to send, unchanged while in passthrough mode, or `nil` if it must be dropped
+      #   because it could not be encrypted
+      def encrypt_audio(frame)
+        @lock.synchronize do
+          return frame if @closed
+          return nil if @dropping_frames
+
+          target = encryptor
+          return frame if target.nil? || target.passthrough?
+
+          target.encrypt(frame, @ssrc)
+        end
+      end
+
+      # Releases the session, the encryptor and the key ratchet.
+      def close
+        @lock.synchronize do
+          return if @closed
+
+          @closed = true
+          @encryptor&.destroy
+          @encryptor = nil
+          @key_ratchet&.destroy
+          @key_ratchet = nil
+          @session&.destroy
+          @session = nil
+        end
+      end
+
+      private
+
+      # Handles a JSON message from the voice gateway.
+      def process_json(opcode, data)
         return if @closed
 
         data ||= {}
@@ -63,15 +122,11 @@ module Discordrb::Voice
           execute_transition(data['transition_id'].to_i)
         when Opcodes::DAVE_PREPARE_EPOCH
           prepare_epoch(data['protocol_version'].to_i, data['epoch'].to_i)
-        when Opcodes::DAVE_MLS_INVALID_COMMIT_WELCOME
-          invalid_commit_welcome
         end
       end
 
-      # Handles a binary message from the voice gateway. The sequence number must already be stripped off.
-      # @param opcode [Integer]
-      # @param payload [String] the rest of the message
-      def handle_binary(opcode, payload)
+      # Handles a binary message from the voice gateway.
+      def process_binary(opcode, payload)
         return if @closed
 
         case opcode
@@ -80,41 +135,22 @@ module Discordrb::Voice
         when Opcodes::DAVE_MLS_PROPOSALS
           process_proposals(payload)
         when Opcodes::DAVE_MLS_ANNOUNCE_COMMIT_TRANSITION
-          transition_id, commit = Framing.split_transition(payload)
-          process_commit(transition_id, commit)
+          transition_id, commit = split_transition(payload)
+          process_commit(transition_id, commit) if transition_id
         when Opcodes::DAVE_MLS_WELCOME
-          transition_id, welcome = Framing.split_transition(payload)
-          process_welcome(transition_id, welcome)
+          transition_id, welcome = split_transition(payload)
+          process_welcome(transition_id, welcome) if transition_id
         end
       end
 
-      # Encrypts one audio frame, if this connection takes part in an established group.
-      # @param frame [String] one Opus frame
-      # @return [String, nil] the frame to send, unchanged while in passthrough mode, or `nil` if it must be dropped
-      #   because it could not be encrypted
-      def encrypt_audio(frame)
-        return frame if @closed
-
-        target = encryptor
-        return frame if target.nil? || target.passthrough?
-
-        target.encrypt(frame, @ssrc)
+      # Splits the transition ID off a DAVE payload, dropping messages that are too short to carry one.
+      # @return [Array(Integer, String), nil]
+      def split_transition(payload)
+        Framing.split_transition(payload)
+      rescue ArgumentError => e
+        DAVE.logger.warn("Ignoring a malformed DAVE message: #{e.message}")
+        nil
       end
-
-      # Releases the session, the encryptor and the key ratchet.
-      def close
-        return if @closed
-
-        @closed = true
-        @encryptor&.destroy
-        @encryptor = nil
-        @key_ratchet&.destroy
-        @key_ratchet = nil
-        @session&.destroy
-        @session = nil
-      end
-
-      private
 
       # The DAVE session, created on first use.
       def session
@@ -172,15 +208,16 @@ module Discordrb::Voice
         @session = nil
         @needs_key_package = true
 
-        # The old key ratchets are worthless as soon as the group is dropped, so the connection passes frames
-        # through unencrypted until the new group is established.
+        # The old key ratchets are worthless as soon as the group is dropped. A connection that has already
+        # encrypted media drops its frames until the new group is established instead of sending them in the clear,
+        # because the call is still end-to-end encrypted for everyone else.
         @key_ratchet&.destroy
         @key_ratchet = nil
         @encryptor&.passthrough = true
+        @dropping_frames = @encryption_established
 
         target = session
         target.init(protocol_version, @channel_id)
-        @recognized_users.each_key { |user_id| target.add_recognized_user(user_id) }
         target.external_sender = @external_sender if @external_sender
 
         send_key_package
@@ -202,10 +239,10 @@ module Discordrb::Voice
       def send_key_package
         return unless @protocol_version.positive? && @needs_key_package && @external_sender && @session
 
-        @needs_key_package = false
         key_package = @session.marshalled_key_package
         return if key_package.nil? || key_package.empty?
 
+        @needs_key_package = false
         DAVE.logger.debug("Sending DAVE key package (#{key_package.bytesize} bytes)")
         @send_binary.call(Opcodes::DAVE_MLS_KEY_PACKAGE, key_package)
       end
@@ -226,14 +263,19 @@ module Discordrb::Voice
         result = @session.process_commit(commit)
         return if result.nil?
 
+        # Read the result and release it before the session state is touched, because resetting the group drops the
+        # session that the result came from.
         begin
-          return invalid_transition(transition_id) if result.failed?
-          return if result.ignored?
-
-          finish_transition(transition_id)
+          failed = result.failed?
+          ignored = result.ignored?
         ensure
           result.destroy
         end
+
+        return invalid_transition(transition_id) if failed
+        return if ignored
+
+        finish_transition(transition_id)
       end
 
       def process_welcome(transition_id, welcome)
@@ -248,11 +290,12 @@ module Discordrb::Voice
 
       # The gateway prepares a protocol version transition. Transition 0 is executed right away without an answer.
       def prepare_transition(protocol_version, transition_id)
-        @protocol_version = protocol_version
+        @pending_transition_id = transition_id
+        @pending_protocol_version = protocol_version
+
         if transition_id.zero?
-          apply_transition
+          execute_transition(transition_id)
         else
-          @pending_transition_id = transition_id
           transition_ready(transition_id)
         end
       end
@@ -260,38 +303,53 @@ module Discordrb::Voice
       # Transition 0 is the very first epoch, which the gateway executes without asking. Every later transition is
       # acknowledged and executed when the gateway sends the execute message.
       def finish_transition(transition_id)
+        # A commit or welcome can arrive without a prepared transition, for example for the very first epoch.
+        if @pending_transition_id != transition_id
+          @pending_transition_id = transition_id
+          @pending_protocol_version = @protocol_version
+        end
+
         if transition_id.zero?
-          apply_transition
+          execute_transition(transition_id)
         else
           transition_ready(transition_id)
         end
       end
 
+      # Executes the transition that was prepared earlier. Every other transition is ignored, because there is
+      # nothing this connection could switch to.
       def execute_transition(transition_id)
         if @pending_transition_id != transition_id
-          DAVE.logger.debug("Executing DAVE transition #{transition_id} without having prepared " \
-                            "#{@pending_transition_id}")
+          DAVE.logger.warn("Ignoring DAVE transition #{transition_id} because it was not prepared")
+          return
         end
 
+        protocol_version = @pending_protocol_version
         @pending_transition_id = nil
-        apply_transition
+        @pending_protocol_version = nil
+        @protocol_version = protocol_version
+        apply_transition(protocol_version)
       end
 
       # Switches the outgoing audio to the key ratchet of the new epoch, or to passthrough mode for version 0.
-      def apply_transition
+      def apply_transition(protocol_version)
         target = encryptor
         return if target.nil?
 
-        if @protocol_version.zero?
+        if protocol_version.zero?
           target.passthrough = true
           @key_ratchet&.destroy
           @key_ratchet = nil
+          @encryption_established = false
+          @dropping_frames = false
           return
         end
 
         ratchet = @session&.key_ratchet(@self_user_id)
         if ratchet.nil?
-          target.passthrough = true
+          # The group is not established yet. A connection that has already encrypted media must not fall back to
+          # plaintext frames, so it drops them until the new group provides a key.
+          @dropping_frames = @encryption_established
           return
         end
 
@@ -299,21 +357,23 @@ module Discordrb::Voice
         @key_ratchet = ratchet
         target.key_ratchet = ratchet
         target.passthrough = false
+        @encryption_established = true
+        @dropping_frames = false
       end
 
       def transition_ready(transition_id)
         @send_json.call(Opcodes::DAVE_TRANSITION_READY, { transition_id: transition_id })
       end
 
+      # Tells the gateway that a commit or welcome could not be processed and starts over with a new group, which is
+      # how the DAVE protocol recovers from a broken MLS state.
       def invalid_transition(transition_id)
-        DAVE.logger.debug("Rejecting DAVE transition #{transition_id}")
+        DAVE.logger.warn("Rejecting DAVE transition #{transition_id} and resetting the MLS group")
         @send_json.call(Opcodes::DAVE_MLS_INVALID_COMMIT_WELCOME, { transition_id: transition_id })
-      end
 
-      # The gateway rejected a message we sent, so we drop our group state and offer a new key package.
-      def invalid_commit_welcome
-        DAVE.logger.warn('The voice gateway rejected a DAVE commit or welcome, resetting the MLS group')
-        reset_group(@protocol_version)
+        @pending_transition_id = nil
+        @pending_protocol_version = nil
+        reset_group(@protocol_version) if @protocol_version.positive?
       end
     end
   end

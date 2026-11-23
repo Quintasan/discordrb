@@ -21,11 +21,6 @@ module Discordrb::Voice
         Library.daveSessionInit(@handle, protocol_version, group_id, @self_user_id)
       end
 
-      # Resets the group state without creating a new group. A new group is created by {#init}.
-      def reset
-        Library.daveSessionReset(@handle)
-      end
-
       # @param version [Integer] the new DAVE protocol version
       def protocol_version=(version)
         Library.daveSessionSetProtocolVersion(@handle, version)
@@ -188,9 +183,15 @@ module Discordrb::Voice
         raise 'libdave could not create a DAVE encryptor' if @handle.null?
 
         @key_ratchet = nil
+        @codec = codec
         @passthrough = true
         Library.daveEncryptorSetPassthroughMode(@handle, true)
         Library.daveEncryptorAssignSsrcToCodec(@handle, ssrc, codec) if ssrc
+      end
+
+      # @param value [Integer, nil] the SSRC of this connection
+      def ssrc=(value)
+        Library.daveEncryptorAssignSsrcToCodec(@handle, value, @codec) if value
       end
 
       # @return [Boolean] whether frames are passed through unencrypted
@@ -201,11 +202,6 @@ module Discordrb::Voice
       # @param value [Boolean] whether frames should be passed through unencrypted
       def passthrough=(value)
         Library.daveEncryptorSetPassthroughMode(@handle, value)
-      end
-
-      # @return [Boolean] whether a key ratchet has been set
-      def key_ratchet?
-        Library.daveEncryptorHasKeyRatchet(@handle)
       end
 
       # @param ratchet [KeyRatchet] the ratchet for this connection's own user
