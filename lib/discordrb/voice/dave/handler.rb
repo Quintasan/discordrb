@@ -230,7 +230,7 @@ module Discordrb::Voice
           return invalid_transition(transition_id) if result.failed?
           return if result.ignored?
 
-          transition_ready(transition_id)
+          finish_transition(transition_id)
         ensure
           result.destroy
         end
@@ -240,7 +240,7 @@ module Discordrb::Voice
         return if @session.nil?
 
         if @session.process_welcome(welcome)
-          transition_ready(transition_id)
+          finish_transition(transition_id)
         else
           invalid_transition(transition_id)
         end
@@ -253,6 +253,16 @@ module Discordrb::Voice
           apply_transition
         else
           @pending_transition_id = transition_id
+          transition_ready(transition_id)
+        end
+      end
+
+      # Transition 0 is the very first epoch, which the gateway executes without asking. Every later transition is
+      # acknowledged and executed when the gateway sends the execute message.
+      def finish_transition(transition_id)
+        if transition_id.zero?
+          apply_transition
+        else
           transition_ready(transition_id)
         end
       end

@@ -232,6 +232,27 @@ describe Discordrb::Voice::DAVE::Handler do
 
       expect(sent).to be_empty
     end
+
+    it 'executes the initial transition right away instead of answering it' do
+      ratchet = instance_double(Discordrb::Voice::DAVE::KeyRatchet)
+      allow(ratchet).to receive(:destroy)
+      allow(session).to receive(:key_ratchet).with(self_user_id.to_s).and_return(ratchet)
+      allow(session).to receive(:process_commit).with('commit').and_return(commit_result)
+
+      encryptor = instance_double(Discordrb::Voice::DAVE::Encryptor, passthrough?: true)
+      allow(encryptor).to receive(:destroy)
+      allow(encryptor).to receive(:passthrough=)
+      allow(encryptor).to receive(:key_ratchet=)
+      allow(Discordrb::Voice::DAVE::Encryptor).to receive(:new).and_return(encryptor)
+      handler.ssrc = 9001
+
+      start_group
+      handler.handle_binary(opcodes::DAVE_MLS_ANNOUNCE_COMMIT_TRANSITION, "#{[0].pack('n')}commit")
+
+      expect(sent).to be_empty
+      expect(encryptor).to have_received(:key_ratchet=).with(ratchet)
+      expect(encryptor).to have_received(:passthrough=).with(false)
+    end
   end
 
   describe 'welcomes' do
@@ -242,6 +263,15 @@ describe Discordrb::Voice::DAVE::Handler do
       handler.handle_binary(opcodes::DAVE_MLS_WELCOME, "#{[4].pack('n')}welcome")
 
       expect(sent).to eq [[opcodes::DAVE_TRANSITION_READY, { transition_id: 4 }]]
+    end
+
+    it 'executes the initial transition right away instead of answering it' do
+      start_group
+      allow(session).to receive(:process_welcome).with('welcome').and_return(true)
+
+      handler.handle_binary(opcodes::DAVE_MLS_WELCOME, "#{[0].pack('n')}welcome")
+
+      expect(sent).to be_empty
     end
 
     it 'flags a welcome it cannot process as invalid' do
